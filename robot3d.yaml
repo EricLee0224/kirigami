@@ -1,0 +1,9 @@
+# Bundled YAM Ultra 2. Override with KIRIGAMI_YAM_ULTRA_DIR if needed.
+urdf: models/yam_ultra/v2/yam_ultra.urdf
+mesh_dir: models/yam_ultra/v2/assets
+base_separation_m: 0.46
+joint_map:
+  left: [joint1, joint2, joint3, joint4, joint5, joint6]
+  right: [joint1, joint2, joint3, joint4, joint5, joint6]
+  left_gripper: gripper
+  right_gripper: gripper

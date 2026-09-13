@@ -1,0 +1,5 @@
+subtasks:
+  - pick_up_egg
+  - drag_egg
+  - place_egg
+  - reset

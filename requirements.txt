@@ -1,0 +1,5 @@
+# Prefer: conda env create -f environment.yml
+# This file is the pip layer only (used by environment.yml).
+PySide6
+opencv-python-headless
+trimesh

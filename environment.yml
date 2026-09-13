@@ -1,0 +1,16 @@
+name: kirigami
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - libxkbcommon
+  - libxcb
+  - xkeyboard-config
+  - pyyaml
+  - numpy
+  - pip
+  - pip:
+      - PySide6
+      - opencv-python-headless
+      - trimesh
