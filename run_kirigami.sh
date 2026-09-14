@@ -10,11 +10,24 @@ if [[ -z "${CONDA_BASE}" ]]; then
     fi
   done
 fi
+if [[ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
+  echo "Conda was not found. Install Miniconda, then run ./setup_env.sh." >&2
+  exit 1
+fi
 # shellcheck disable=SC1091
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate kirigami
+if ! conda activate kirigami; then
+  echo "Kirigami environment is missing. Run $ROOT/setup_env.sh first." >&2
+  exit 1
+fi
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# Headless servers have no X11. Override on a desktop if needed, e.g. QT_QPA_PLATFORM=xcb
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+# Use the host's real desktop session. Do not invent DISPLAY or use offscreen.
+if [[ -z "${QT_QPA_PLATFORM:-}" ]]; then
+  if [[ -n "${DISPLAY:-}" ]]; then
+    export QT_QPA_PLATFORM=xcb
+  elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    export QT_QPA_PLATFORM=wayland
+  fi
+fi
 cd "$ROOT"
-python -m kirigami.app "$@"
+exec python -m kirigami.app "$@"

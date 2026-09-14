@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .source_guard import episode_lock, source_revision
+
 CAM_KEYS = ("base_0", "left_wrist_0", "right_wrist_0")
 CAM_VIDEO_NAMES = {
     "base_0": "base_0_rgb.mp4",
@@ -91,6 +93,7 @@ class LoadedEpisode:
     action_aligned: np.ndarray
     n_frames: int
     fps: float = 30.0
+    source_revision: str = ""
 
     @property
     def duration_s(self) -> float:
@@ -206,6 +209,11 @@ def _find_extra_videos(cam_dir: Path, main_videos: set[str]) -> dict[str, Path]:
 
 
 def load_episode(path: Path) -> LoadedEpisode:
+    with episode_lock(path):
+        return _load_episode(path)
+
+
+def _load_episode(path: Path) -> LoadedEpisode:
     ep = Path(path)
     if not is_episode_dir(ep):
         raise FileNotFoundError(f"not a prometheus episode: {ep}")
@@ -298,6 +306,7 @@ def load_episode(path: Path) -> LoadedEpisode:
         action_aligned=act_aligned,
         n_frames=n_frames,
         fps=fps,
+        source_revision=source_revision(ep),
     )
 
 

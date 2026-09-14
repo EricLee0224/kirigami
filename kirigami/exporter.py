@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import fcntl
 import pickle
 import shutil
 import subprocess
+import tempfile
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,8 +17,9 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from .annotation import Annotation, Segment
+from .annotation import Annotation, Segment, atomic_write_text, validate_subtask_name
 from .loader import CAM_KEYS, CAM_VIDEO_NAMES, LoadedEpisode
+from .source_guard import assert_source_revision, episode_lock
 
 ProgressCb = Callable[[str, float], None]
 
@@ -90,7 +94,7 @@ def cut_video(
     camera_meta: dict | None = None,
 ) -> None:
     """Frame-accurate re-encode. end is exclusive."""
-    if end <= start:
+    if start < 0 or end <= start:
         raise ValueError(f"empty video range [{start}, {end})")
     dst.parent.mkdir(parents=True, exist_ok=True)
     meta = camera_meta or {}
@@ -118,22 +122,30 @@ def cut_video(
         pix,
         "-crf",
         str(crf),
-        "-tag:v",
-        "hvc1",
-        str(dst),
     ]
+    if encoder in {"libx265", "hevc_nvenc", "hevc_vaapi"}:
+        cmd.extend(["-tag:v", "hvc1"])
+    cmd.extend(["-fps_mode", "passthrough", str(dst)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 or not dst.exists():
         raise RuntimeError(f"ffmpeg failed for {src.name} [{start},{end}): {proc.stderr.strip()}")
+    actual = _count_video_frames(dst)
+    if actual != end - start:
+        raise RuntimeError(f"Video frame mismatch for {src.name}: expected {end - start}, decoded {actual}")
 
 
 def _count_video_frames(path: Path) -> int:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         return -1
-    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    return n
+    try:
+        # Decode every exported frame: container counts alone miss truncated data.
+        n = 0
+        while cap.grab():
+            n += 1
+        return n
+    finally:
+        cap.release()
 
 
 def _update_task_fields(obj, subtask: str) -> None:
@@ -248,26 +260,56 @@ def _dump_pickle(path: Path, obj) -> None:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def remove_previous_exports(out_root: Path, source_path: Path) -> int:
-    """Delete sliced episodes whose slice_meta.source_path matches this source."""
-    out_root = Path(out_root)
-    if not out_root.exists():
-        return 0
+def _previous_exports(out_root: Path, source_path: Path) -> list[Path]:
+    out_root = Path(out_root).resolve()
     source = str(Path(source_path).resolve())
-    removed = 0
+    previous = []
     for meta in out_root.glob("*/*/slice_meta.json"):
+        if meta.parent.is_symlink() or meta.parent.parent.is_symlink() or not meta.resolve().is_relative_to(out_root):
+            continue
         try:
             data = json.loads(meta.read_text())
         except Exception:
             continue
         if data.get("source_path") == source:
-            shutil.rmtree(meta.parent, ignore_errors=True)
-            removed += 1
-    return removed
+            previous.append(meta.parent)
+    return previous
 
 
-def _next_index_name(subtask_dir: Path, src_ep: str, seg_idx: int) -> Path:
-    return subtask_dir / f"{src_ep}_{seg_idx:02d}"
+def remove_previous_exports(out_root: Path, source_path: Path) -> int:
+    """Delete only exports owned by this source; normal export uses staging below."""
+    previous = _previous_exports(out_root, source_path)
+    for path in previous:
+        shutil.rmtree(path)
+    return len(previous)
+
+
+def _destination(out_root: Path, episode: LoadedEpisode, segment: Segment, index: int) -> Path:
+    subtask = validate_subtask_name(segment.subtask)
+    source_id = hashlib.sha256(str(episode.ref.path.resolve()).encode()).hexdigest()[:12]
+    episode_id = validate_subtask_name(episode.ref.episode_id)
+    dest = out_root / subtask / f"{episode_id}_{source_id}_{index:02d}"
+    if dest.parent.is_symlink() or dest.is_symlink() or not dest.resolve().is_relative_to(out_root):
+        raise ValueError(f"Output path escapes output root or uses a symlink: {dest}")
+    return dest
+
+
+def validate_episode_for_export(episode: LoadedEpisode) -> None:
+    for key in CAM_KEYS:
+        if key not in episode.videos:
+            raise ValueError(f"Missing required camera video: {key}")
+        ts = episode.cam_ts.get(key)
+        if ts is None or len(ts) != episode.n_frames:
+            raise ValueError(f"Camera timestamp count mismatch: {key}")
+        if ts.ndim != 1 or (len(ts) > 1 and np.any(np.diff(ts) <= 0)):
+            raise ValueError(f"Camera timestamps must be strictly increasing: {key}")
+    for name, data in [("left", episode.robot_raw.get("left", {})), ("right", episode.robot_raw.get("right", {})), ("action", episode.action_raw)]:
+        ts = data.get("timestamps", [])
+        if len(ts) == 0 or np.any(np.diff(np.asarray(ts, dtype=np.int64)) < 0):
+            raise ValueError(f"Missing or unsorted {name} timestamps")
+        for key, value in data.items():
+            if isinstance(value, list) and len(value) != len(ts):
+                raise ValueError(f"{name}.{key} has {len(value)} samples, expected {len(ts)}")
 
 
 def export_segment(
@@ -275,18 +317,20 @@ def export_segment(
     segment: Segment,
     dest: Path,
     progress: ProgressCb | None = None,
+    *,
+    manifest_dest: Path | None = None,
 ) -> Path:
     if segment.n_frames <= 0:
         raise ValueError("empty segment")
-    subtask = segment.subtask.strip()
-    if not subtask:
-        raise ValueError("segment has no subtask name")
+    subtask = validate_subtask_name(segment.subtask)
+    if not 0 <= segment.start_frame < segment.end_frame <= episode.n_frames:
+        raise ValueError("Segment is outside the source frame range")
+    validate_episode_for_export(episode)
 
     t0, t1 = episode.frame_range_timestamps(segment.start_frame, segment.end_frame)
     start, end = segment.start_frame, segment.end_frame
     dest = Path(dest)
-    if dest.exists():
-        shutil.rmtree(dest)
+    # Never remove a caller's directory. Replacement is handled transactionally.
     dest.mkdir(parents=True)
 
     cam_ts = slice_camera_timestamps(episode.cam_ts, start, end)
@@ -298,6 +342,8 @@ def export_segment(
     n_robot = len((robot.get("left") or {}).get("timestamps") or [])
     n_action = len(action.get("timestamps") or [])
     n_event = len(event.get("timestamps") or [])
+    if not n_robot or not len((robot.get("right") or {}).get("timestamps") or []) or not n_action:
+        raise ValueError("Segment has no robot or action samples in its time range")
 
     jobs: list[tuple[str, Path, Path, dict | None]] = []
     for key in CAM_KEYS:
@@ -329,7 +375,7 @@ def export_segment(
     (dest / "camera").mkdir(parents=True, exist_ok=True)
     (dest / "camera" / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
 
-    mans = rewrite_manifests(episode.manifests, subtask, n_cam, n_robot, n_action, n_event, dest)
+    mans = rewrite_manifests(episode.manifests, subtask, n_cam, n_robot, n_action, n_event, manifest_dest or dest)
     man_dir = dest / "manifests"
     man_dir.mkdir(parents=True, exist_ok=True)
     if mans:
@@ -351,23 +397,74 @@ def export_annotation(
     replace_previous: bool = True,
     progress: ProgressCb | None = None,
 ) -> list[Path]:
-    segs = annotation.exportable()
+    with episode_lock(episode.ref.path):
+        assert_source_revision(episode.ref.path, episode.source_revision)
+        return _export_annotation_locked(episode, annotation, out_root, replace_previous, progress)
+
+
+def _export_annotation_locked(episode, annotation, out_root, replace_previous, progress):
+    segs = [(i, s) for i, s in enumerate(annotation.segments) if not s.discard and s.n_frames > 0]
     if not segs:
         raise ValueError("no exportable segments (need subtask names and Export checked)")
-    out_root = Path(out_root)
+    out_root = Path(out_root).expanduser().resolve()
+    validate_episode_for_export(episode)
+    destinations = [_destination(out_root, episode, seg, i) for i, seg in segs]
+    for _, seg in segs:
+        if not 0 <= seg.start_frame < seg.end_frame <= episode.n_frames:
+            raise ValueError("Segment is outside the source frame range")
     out_root.mkdir(parents=True, exist_ok=True)
-    if replace_previous:
-        remove_previous_exports(out_root, episode.ref.path)
-
-    written: list[Path] = []
-    n = len(segs)
-    for i, seg in enumerate(segs):
-        sub_dir = out_root / seg.subtask.strip()
-        dest = _next_index_name(sub_dir, episode.ref.episode_id, i)
-
-        def _cb(msg: str, frac: float, i=i) -> None:
-            if progress:
-                progress(msg, (i + frac) / n)
-
-        written.append(export_segment(episode, seg, dest, progress=_cb))
-    return written
+    with open(out_root / ".kirigami-export.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("Another export is already writing to this output root") from exc
+        previous = _previous_exports(out_root, episode.ref.path) if replace_previous else []
+        for dest in destinations:
+            if dest.exists() and dest not in previous:
+                raise FileExistsError(f"Refusing to overwrite an existing directory: {dest}")
+        staging = Path(tempfile.mkdtemp(prefix=".kirigami-export-", dir=out_root))
+        backups: list[tuple[Path, Path]] = []
+        installed: list[Path] = []
+        preserve_staging = False
+        try:
+            staged = []
+            for position, ((_, seg), dest) in enumerate(zip(segs, destinations)):
+                def _cb(msg: str, frac: float, position=position) -> None:
+                    if progress:
+                        progress(msg, 0.95 * (position + frac) / len(segs))
+                staged.append(export_segment(episode, seg, staging / "new" / str(position), progress=_cb, manifest_dest=dest))
+            # Keep all previous data until every new segment has passed validation.
+            (staging / "backup").mkdir()
+            atomic_write_text(staging / "recovery.json", json.dumps({
+                "source_path": str(episode.ref.path.resolve()),
+                "previous": [{"destination": str(old), "backup": f"backup/{index}"} for index, old in enumerate(previous)],
+                "new_destinations": [str(dest) for dest in destinations],
+            }, indent=2) + "\n")
+            for index, old in enumerate(previous):
+                backup = staging / "backup" / str(index)
+                old.rename(backup)
+                backups.append((old, backup))
+            for source, dest in zip(staged, destinations):
+                if dest.parent.is_symlink() or not dest.resolve().is_relative_to(out_root):
+                    raise ValueError(f"Output path changed during export: {dest}")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    raise FileExistsError(f"Output appeared during export: {dest}")
+                source.rename(dest)
+                installed.append(dest)
+        except BaseException:
+            try:
+                for dest in reversed(installed):
+                    shutil.rmtree(dest)
+                for old, backup in reversed(backups):
+                    backup.rename(old)
+            except OSError as rollback_error:
+                preserve_staging = True
+                raise RuntimeError(f"Could not restore previous exports; backups are preserved in {staging}") from rollback_error
+            raise
+        finally:
+            if not preserve_staging:
+                shutil.rmtree(staging, ignore_errors=True)
+        if progress:
+            progress("Export complete", 1.0)
+        return destinations

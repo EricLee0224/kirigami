@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +13,7 @@ from pathlib import Path
 import yaml
 
 from .loader import ANNOTATION_REL, LoadedEpisode
+from .source_guard import assert_source_revision, episode_lock, source_revision
 
 SCHEMA = "kirigami_annotation_v1"
 
@@ -44,12 +48,50 @@ class Annotation:
     exported_at: str = ""
     output_root: str = ""
     schema: str = SCHEMA
+    exported_signature: str = ""
+    trim_start: int = 0
+    trim_end: int | None = None
+    source_revision: str = field(default="", repr=False)
+
+    @property
+    def keep_range(self) -> tuple[int, int]:
+        return self.trim_start, self.n_frames if self.trim_end is None else self.trim_end
 
     def exportable(self) -> list[Segment]:
         return [s for s in self.segments if not s.discard and s.n_frames > 0 and s.subtask.strip()]
 
     def missing_names(self) -> list[Segment]:
         return [s for s in self.segments if not s.discard and s.n_frames > 0 and not s.subtask.strip()]
+
+    def signature(self) -> str:
+        payload = [self.source_path, self.n_frames, self.marks, [s.as_dict() for s in self.segments]]
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def invalidate_export(self) -> None:
+        self.exported_at = ""
+        self.exported_signature = ""
+
+
+def validate_subtask_name(name: str) -> str:
+    name = name.strip()
+    if not name or name in {".", ".."} or any(c in name for c in "/\\") or any(ord(c) < 32 for c in name):
+        raise ValueError("Subtask must be a folder name, without /, \\, . or .. path components.")
+    return name
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as f:
+            temporary = Path(f.name)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def normalize_marks(marks: list[int], n_frames: int) -> list[int]:
@@ -93,6 +135,7 @@ def annotation_from_episode(episode: LoadedEpisode, existing: Annotation | None 
             n_frames=episode.n_frames,
             marks=marks,
             segments=segs,
+            source_revision=episode.source_revision,
         )
     marks = normalize_marks(existing.marks, episode.n_frames)
     segs = rebuild_segments(marks, episode.n_frames, existing.segments)
@@ -101,11 +144,35 @@ def annotation_from_episode(episode: LoadedEpisode, existing: Annotation | None 
     existing.source_episode_id = episode.ref.episode_id
     existing.marks = marks
     existing.segments = segs
+    existing.source_revision = episode.source_revision
+    start, end = existing.keep_range
+    if not 0 <= start < end <= episode.n_frames:
+        existing.trim_start, existing.trim_end = 0, None
     return existing
 
 
+def trim_annotation(ann: Annotation, start: int, end: int) -> Annotation:
+    """Clip existing labeled intervals and rebase to the retained first frame."""
+    if not 0 <= start < end <= ann.n_frames:
+        raise ValueError("Keep range must contain at least one frame within the episode")
+    from copy import deepcopy
+    out = deepcopy(ann)
+    out.n_frames = end - start
+    out.marks = [m - start for m in ann.marks if start < m < end]
+    out.segments = [Segment(max(s.start_frame, start) - start, min(s.end_frame, end) - start,
+                            s.subtask, s.discard)
+                    for s in ann.segments if s.end_frame > start and s.start_frame < end]
+    out.trim_start, out.trim_end = 0, None
+    out.source_revision = ""
+    out.invalidate_export()
+    return out
+
+
 def set_marks(ann: Annotation, marks: list[int]) -> Annotation:
-    ann.marks = normalize_marks(marks, ann.n_frames)
+    marks = normalize_marks(marks, ann.n_frames)
+    if marks != ann.marks:
+        ann.invalidate_export()
+    ann.marks = marks
     ann.segments = rebuild_segments(ann.marks, ann.n_frames, ann.segments)
     return ann
 
@@ -143,7 +210,7 @@ def load_annotation(ep_dir: Path) -> Annotation | None:
         return None
     data = json.loads(path.read_text())
     segs = [Segment(**s) for s in data.get("segments") or []]
-    return Annotation(
+    ann = Annotation(
         source_path=data.get("source_path", str(Path(ep_dir).resolve())),
         source_episode_id=data.get("source_episode_id", Path(ep_dir).name),
         n_frames=int(data.get("n_frames") or 0),
@@ -152,12 +219,29 @@ def load_annotation(ep_dir: Path) -> Annotation | None:
         exported_at=data.get("exported_at", ""),
         output_root=data.get("output_root", ""),
         schema=data.get("schema", SCHEMA),
+        exported_signature=data.get("exported_signature", ""),
+        trim_start=int(data.get("trim_start", 0)),
+        trim_end=int(data["trim_end"]) if data.get("trim_end") is not None else None,
+        source_revision=source_revision(ep_dir),
     )
+    # Legacy sidecars predate signatures; establish a baseline before editing.
+    if ann.exported_at and not ann.exported_signature:
+        ann.exported_signature = ann.signature()
+    return ann
 
 
 def save_annotation(ep_dir: Path, ann: Annotation) -> Path:
+    with episode_lock(ep_dir):
+        if source_revision(ep_dir):
+            assert_source_revision(ep_dir, ann.source_revision)
+        return _save_annotation(ep_dir, ann)
+
+
+def _save_annotation(ep_dir: Path, ann: Annotation) -> Path:
     path = Path(ep_dir) / ANNOTATION_REL
     path.parent.mkdir(parents=True, exist_ok=True)
+    if ann.exported_at and ann.exported_signature != ann.signature():
+        ann.invalidate_export()
     payload = {
         "schema": ann.schema,
         "source_path": ann.source_path,
@@ -167,14 +251,18 @@ def save_annotation(ep_dir: Path, ann: Annotation) -> Path:
         "segments": [s.as_dict() for s in ann.segments],
         "exported_at": ann.exported_at,
         "output_root": ann.output_root,
+        "exported_signature": ann.exported_signature,
+        "trim_start": ann.trim_start,
+        "trim_end": ann.trim_end,
     }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return path
 
 
 def mark_exported(ann: Annotation, output_root: Path) -> None:
     ann.exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     ann.output_root = str(Path(output_root).resolve())
+    ann.exported_signature = ann.signature()
 
 
 def load_subtask_presets(path: Path) -> list[str]:
@@ -203,7 +291,7 @@ def save_subtask_presets(path: Path, names: list[str]) -> None:
         if isinstance(loaded, dict):
             existing = loaded
     existing["subtasks"] = names
-    path.write_text(yaml.safe_dump(existing, sort_keys=False, allow_unicode=True))
+    atomic_write_text(path, yaml.safe_dump(existing, sort_keys=False, allow_unicode=True))
 
 
 def add_preset(names: list[str], new_name: str) -> list[str]:

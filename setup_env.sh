@@ -10,6 +10,10 @@ if [[ -z "${CONDA_BASE}" ]]; then
     fi
   done
 fi
+if [[ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
+  echo "Conda was not found. Install Miniconda before running this script." >&2
+  exit 1
+fi
 # shellcheck disable=SC1091
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 if conda env list | awk '{print $1}' | grep -qx kirigami; then
@@ -17,4 +21,5 @@ if conda env list | awk '{print $1}' | grep -qx kirigami; then
 else
   conda env create -f "$ROOT/environment.yml"
 fi
-echo "kirigami env ready. Launch with: $ROOT/run_kirigami.sh"
+echo "Kirigami env ready. In a host desktop terminal, verify with: $ROOT/run_kirigami.sh --check"
+echo "Launch with: $ROOT/run_kirigami.sh"

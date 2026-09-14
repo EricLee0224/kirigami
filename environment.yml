@@ -6,11 +6,17 @@ dependencies:
   - ffmpeg
   - libxkbcommon
   - libxcb
+  - xcb-util-cursor
+  - xcb-util-wm
+  - xcb-util-keysyms
+  - xcb-util-image
+  - xcb-util-renderutil
   - xkeyboard-config
   - pyyaml
   - numpy
+  - scipy>=1.11,<2
   - pip
   - pip:
       - PySide6
       - opencv-python-headless
-      - trimesh
+      - trimesh>=5.1,<6

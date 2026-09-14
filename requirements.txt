@@ -2,4 +2,5 @@
 # This file is the pip layer only (used by environment.yml).
 PySide6
 opencv-python-headless
-trimesh
+trimesh>=5.1,<6
+scipy>=1.11,<2

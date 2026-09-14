@@ -236,8 +236,7 @@ class TestExportSynthetic(unittest.TestCase):
             cap = cv2.VideoCapture(str(out_vid))
             n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
-            self.assertGreaterEqual(n, 6)
-            self.assertLessEqual(n, 8)
+            self.assertEqual(n, 7)
 
             ann = annotation_from_episode(episode)
             set_marks(ann, [5, 12])

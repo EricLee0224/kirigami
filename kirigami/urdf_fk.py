@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -85,6 +86,31 @@ class VisualSpec:
     origin: np.ndarray
     mesh_path: Path
     color: np.ndarray
+    scale: np.ndarray
+
+
+@dataclass(eq=False)
+class MeshGeometry:
+    vertices: np.ndarray
+    faces: np.ndarray
+    # Interleaved triangle positions/normals, uploaded once per OpenGL context.
+    vertex_data: np.ndarray
+
+
+@lru_cache(maxsize=32)
+def _load_geometry(path: Path, mtime_ns: int, size: int) -> MeshGeometry:
+    """Share original surfaces across both arms; file changes invalidate the cache."""
+    mesh = trimesh.load(str(path), force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_geometry()
+    if not isinstance(mesh, trimesh.Trimesh) or not len(mesh.faces):
+        raise ValueError(f"No triangle geometry in {path}")
+    # Split normals at CAD creases without removing or changing any triangles.
+    smooth = trimesh.graph.smooth_shade(mesh, angle=np.radians(35))
+    data = np.concatenate(
+        [smooth.vertices[smooth.faces], smooth.vertex_normals[smooth.faces]], axis=2,
+    ).reshape(-1, 6).astype(np.float32)
+    return MeshGeometry(np.asarray(mesh.vertices), np.asarray(mesh.faces), data)
 
 
 class UrdfArm:
@@ -96,7 +122,7 @@ class UrdfArm:
         self.joints: dict[str, JointSpec] = {}
         self.children: dict[str, list[str]] = {}
         self.visuals: list[VisualSpec] = []
-        self.meshes: list[tuple[VisualSpec, np.ndarray, np.ndarray]] = []
+        self.meshes: list[tuple[VisualSpec, MeshGeometry]] = []
         self.transforms: dict[str, np.ndarray] = {}
         self._parse()
         self._load_meshes()
@@ -135,27 +161,16 @@ class UrdfArm:
                         rgba = np.fromstring(col.get("rgba"), sep=" ", dtype=np.float64)
                         if rgba.size >= 3:
                             color = rgba[:3] * (255.0 if rgba.max() <= 1.0 else 1.0)
-                self.visuals.append(VisualSpec(name, _parse_origin(visual), path, color))
+                self.visuals.append(VisualSpec(name, _parse_origin(visual), path, color, _xyz(mesh, "scale", "1 1 1")))
 
     def _load_meshes(self) -> None:
         for vis in self.visuals:
-            if not vis.mesh_path.exists():
-                continue
-            mesh = trimesh.load(str(vis.mesh_path), force="mesh")
-            if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.dump(concatenate=True)
-            try:
-                hull = mesh.convex_hull
-                verts = np.asarray(hull.vertices, dtype=np.float64)
-                faces = np.asarray(hull.faces, dtype=np.int64)
-            except Exception:
-                verts = np.asarray(mesh.vertices, dtype=np.float64)
-                faces = np.asarray(mesh.faces, dtype=np.int64)
-            if faces.size == 0:
-                continue
-            if vis.link in {"tip_left", "tip_right"}:
-                continue
-            self.meshes.append((vis, verts, faces))
+            path = vis.mesh_path.resolve()
+            stat = path.stat()  # Missing parts must not silently produce an incomplete model.
+            geometry = _load_geometry(path, stat.st_mtime_ns, stat.st_size)
+            self.meshes.append((vis, geometry))
+        if not self.meshes:
+            raise ValueError("URDF contains no visual meshes")
 
     def update(self, cfg: dict[str, float]) -> None:
         self.transforms = {"base": self.base.copy()}
@@ -181,14 +196,20 @@ class UrdfArm:
             return None
         return T[:3, 3].astype(np.float32)
 
-    def world_meshes(self) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        out = []
-        for vis, verts, faces in self.meshes:
+    def visual_instances(self):
+        """Static local geometry and its current model matrix; no per-frame mesh copies."""
+        for vis, geometry in self.meshes:
             T_link = self.transforms.get(vis.link)
             if T_link is None:
                 continue
-            Tw = T_link @ vis.origin
+            Tw = T_link @ vis.origin @ np.diag([*vis.scale, 1.0])
+            yield geometry, Tw, vis.color
+
+    def world_meshes(self) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        out = []
+        for geometry, Tw, color in self.visual_instances():
+            verts, faces = geometry.vertices, geometry.faces
             ones = np.ones((len(verts), 1), dtype=np.float64)
             world = (Tw @ np.hstack([verts, ones]).T).T[:, :3]
-            out.append((world, faces, vis.color))
+            out.append((world, faces, color))
         return out
