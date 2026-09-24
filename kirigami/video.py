@@ -7,10 +7,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .camera import validate_camera_timestamps
+from .loader import nearest_indices
+
 
 class VideoBank:
-    def __init__(self, videos: dict[str, Path]):
+    def __init__(self, videos: dict[str, Path], timestamps: dict[str, np.ndarray] | None = None):
         self.paths = {k: Path(p) for k, p in videos.items()}
+        self.frame_indices = {}
+        if timestamps is not None:
+            base = validate_camera_timestamps("base_0", timestamps.get("base_0", []))
+            self.frame_indices = {key: nearest_indices(validate_camera_timestamps(key, timestamps.get(key, [])), base)
+                                  for key in self.paths}
         self.caps: dict[str, cv2.VideoCapture] = {}
         self.idx: dict[str, int] = {}
         self._last: dict[str, np.ndarray | None] = {}
@@ -36,7 +44,9 @@ class VideoBank:
         self.close()
 
     def read(self, frame_idx: int) -> dict[str, np.ndarray | None]:
-        return {key: self._read_one(key, frame_idx) for key in self.caps}
+        return {key: self._read_one(key, int(self.frame_indices[key][frame_idx])
+                                   if key in self.frame_indices and 0 <= frame_idx < len(self.frame_indices[key]) else frame_idx)
+                for key in self.caps}
 
     def _read_one(self, key: str, target: int) -> np.ndarray | None:
         cap = self.caps[key]

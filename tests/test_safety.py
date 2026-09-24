@@ -127,7 +127,7 @@ class TestExportSafety(unittest.TestCase):
         short = self.root / "short.mp4"
         _write_tiny_mp4(short, n_frames=3)
         broken.videos["left_wrist_0"] = short
-        with self.assertRaisesRegex(RuntimeError, "frame mismatch"):
+        with self.assertRaisesRegex(ValueError, "video/timestamp count mismatch"):
             export_annotation(broken, self.ann, self.out)
         self.assertEqual(snapshot(old), before)
 

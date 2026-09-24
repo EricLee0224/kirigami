@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from .source_guard import episode_lock, source_revision
+from .camera import CAMERA_VIDEO_SUFFIXES, frame_time_range
 
 CAM_KEYS = ("base_0", "left_wrist_0", "right_wrist_0")
 CAM_VIDEO_NAMES = {
@@ -109,20 +110,7 @@ class LoadedEpisode:
 
     def frame_range_timestamps(self, start: int, end: int) -> tuple[int, int]:
         """Unix-ms [t_start, t_end) for a half-open frame range."""
-        if self.n_frames == 0:
-            return 0, 0
-        start = int(np.clip(start, 0, self.n_frames))
-        end = int(np.clip(end, 0, self.n_frames))
-        if start >= end:
-            t = int(self.base_ts[min(start, self.n_frames - 1)])
-            return t, t
-        t0 = int(self.base_ts[start])
-        if end >= self.n_frames:
-            dt = int(self.base_ts[-1] - self.base_ts[-2]) if self.n_frames >= 2 else 33
-            t1 = int(self.base_ts[-1]) + max(dt, 1)
-        else:
-            t1 = int(self.base_ts[end])
-        return t0, t1
+        return frame_time_range(self.base_ts, start, end)
 
 
 def is_episode_dir(path: Path) -> bool:
@@ -201,7 +189,9 @@ def _find_extra_videos(cam_dir: Path, main_videos: set[str]) -> dict[str, Path]:
     extra: dict[str, Path] = {}
     if not cam_dir.is_dir():
         return extra
-    for path in sorted(cam_dir.rglob("*.mp4")):
+    for path in sorted(cam_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in CAMERA_VIDEO_SUFFIXES:
+            continue
         if path.name in main_videos:
             continue
         extra[path.name] = path

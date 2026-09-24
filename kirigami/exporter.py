@@ -20,6 +20,8 @@ import numpy as np
 from .annotation import Annotation, Segment, atomic_write_text, validate_subtask_name
 from .loader import CAM_KEYS, CAM_VIDEO_NAMES, LoadedEpisode
 from .source_guard import assert_source_revision, episode_lock
+from .camera import (PRESERVED_CAMERA_SUFFIXES, camera_frame_ranges, camera_key,
+                     ignored_camera_streams, rewrite_sample_counts, validate_camera_timestamps)
 
 ProgressCb = Callable[[str, float], None]
 
@@ -72,9 +74,11 @@ def slice_keyed_lists(data: dict, t0: int, t1: int, ts_key: str = "timestamps") 
 
 
 def slice_camera_timestamps(cam_ts: dict[str, np.ndarray], start: int, end: int) -> dict[str, list[int]]:
+    ranges = camera_frame_ranges(cam_ts, start, end)
     out: dict[str, list[int]] = {}
     for key, arr in cam_ts.items():
-        sl = np.asarray(arr)[start:end]
+        a, b = ranges[key]
+        sl = np.asarray(arr)[a:b]
         out[key] = [int(v) for v in sl]
     return out
 
@@ -84,6 +88,22 @@ def _ffmpeg_bin() -> str:
     if not exe:
         raise RuntimeError("ffmpeg not found on PATH (activate the kirigami env)")
     return exe
+
+
+def _probe_video_stream(path: Path) -> dict:
+    exe = shutil.which("ffprobe")
+    if not exe:
+        raise RuntimeError("ffprobe not found on PATH (activate the kirigami env)")
+    proc = subprocess.run([
+        exe, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,pix_fmt,width,height", "-of", "json", str(path),
+    ], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Cannot inspect camera video {path.name}: {proc.stderr.strip()}")
+    streams = json.loads(proc.stdout).get("streams", [])
+    if not streams or not streams[0].get("pix_fmt"):
+        raise ValueError(f"Missing video stream or pixel format: {path}")
+    return streams[0]
 
 
 def cut_video(
@@ -104,6 +124,15 @@ def cut_video(
     if isinstance(quality, dict) and quality.get("value") is not None:
         crf = int(quality["value"])
     encoder = meta.get("encoder") or "libx265"
+    if src.suffix.lower() == ".mkv":
+        # Recorder IR streams use FFV1, and metadata stores "codec" rather
+        # than "encoder". Probe the actual format, including when metadata is
+        # absent; never fall back to RGB/HEVC or reduce sensor bit depth.
+        stream = _probe_video_stream(src)
+        if stream["codec_name"] != "ffv1":
+            raise ValueError(f"Unsupported MKV codec in {src.name}: {stream['codec_name']}; expected lossless FFV1")
+        encoder = "ffv1"
+        pix = "+" + stream["pix_fmt"]  # Fail instead of silently converting.
     vf = f"trim=start_frame={start}:end_frame={end},setpts=PTS-STARTPTS"
     cmd = [
         _ffmpeg_bin(),
@@ -113,6 +142,8 @@ def cut_video(
         "-y",
         "-i",
         str(src),
+        "-map",
+        "0:v:0",
         "-vf",
         vf,
         "-an",
@@ -120,10 +151,12 @@ def cut_video(
         encoder,
         "-pix_fmt",
         pix,
-        "-crf",
-        str(crf),
     ]
-    if encoder in {"libx265", "hevc_nvenc", "hevc_vaapi"}:
+    if encoder == "ffv1":
+        cmd.extend(["-level", "3", "-coder", "1", "-context", "1", "-g", "1", "-slicecrc", "1"])
+    else:
+        cmd.extend(["-crf", str(crf)])
+    if dst.suffix.lower() == ".mp4" and encoder in {"libx265", "hevc_nvenc", "hevc_vaapi"}:
         cmd.extend(["-tag:v", "hvc1"])
     cmd.extend(["-fps_mode", "passthrough", str(dst)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -148,6 +181,23 @@ def _count_video_frames(path: Path) -> int:
         cap.release()
 
 
+def validate_camera_video(path: Path, key: str, n_timestamps: int) -> None:
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open camera video: {path}")
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        cap.release()
+    # Matroska's reported count can be estimated from duration/fps. Sensor
+    # timestamps must be checked against the actual number of decoded frames.
+    if n <= 0 or path.suffix.lower() == ".mkv":
+        n = _count_video_frames(path)
+    if n != n_timestamps:
+        raise ValueError(f"Camera video/timestamp count mismatch: {key}: {path.name} has {n} frames, "
+                         f"but its timestamp stream has {n_timestamps}")
+
+
 def _update_task_fields(obj, subtask: str) -> None:
     if isinstance(obj, dict):
         if "task" in obj and isinstance(obj["task"], dict):
@@ -160,11 +210,6 @@ def _update_task_fields(obj, subtask: str) -> None:
             _update_task_fields(item, subtask)
 
 
-def _set_if_present(obj: dict, key: str, value) -> None:
-    if key in obj:
-        obj[key] = value
-
-
 def rewrite_manifests(
     manifests: dict[str, dict],
     subtask: str,
@@ -173,60 +218,49 @@ def rewrite_manifests(
     n_action: int,
     n_event: int,
     dest_dir: Path,
+    *,
+    camera_counts: dict[str, int] | None = None,
+    robot_counts: dict[str, int] | None = None,
+    excluded_cameras: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for name, raw in manifests.items():
-        doc = deepcopy(raw)
-        _walk_counts(doc, n_cam=n_cam, n_robot=n_robot, n_action=n_action, n_event=n_event, dest_dir=dest_dir)
+        doc = rewrite_sample_counts(raw,
+            camera_counts if camera_counts is not None else {f"camera.{key}_rgb": n_cam for key in CAM_KEYS},
+            robot_counts if robot_counts is not None else {"left": n_robot, "right": n_robot}, n_action, n_event, n_cam,
+            excluded_cameras=excluded_cameras)
+        _update_episode_dirs(doc, dest_dir)
         _update_task_fields(doc, subtask)
         out[name] = doc
     return out
 
 
-def _walk_counts(obj, n_cam: int, n_robot: int, n_action: int, n_event: int, dest_dir: Path) -> None:
+def _update_episode_dirs(obj, dest_dir: Path) -> None:
     if isinstance(obj, dict):
-        if "counts" in obj and isinstance(obj["counts"], dict):
-            c = obj["counts"]
-            if "action.executed" in c:
-                c["action.executed"] = n_action
-            if "robot.robot_state" in c:
-                c["robot.robot_state"] = n_robot
-            if "event.workflow" in c:
-                c["event.workflow"] = n_event
-            for cam in CAM_KEYS:
-                key = f"camera.{cam}_rgb"
-                if key in c:
-                    c[key] = n_cam
-            if "items" in c:
-                c["items"] = n_cam * 3 + n_robot + n_action + n_event
-        if "camera_frames" in obj and isinstance(obj["camera_frames"], dict):
-            for k in list(obj["camera_frames"]):
-                obj["camera_frames"][k] = n_cam
-        for key, val in (
-            ("camera_timestamp_samples", n_cam),
-            ("complete_sensor_bundles", n_cam),
-            ("executed_actions", n_action),
-            ("event_samples", n_event),
-        ):
-            _set_if_present(obj, key, val)
-        if "robot_samples" in obj and isinstance(obj["robot_samples"], dict):
-            obj["robot_samples"] = {side: n_robot for side in obj["robot_samples"]}
-        if "incomplete_robot_samples" in obj and isinstance(obj["incomplete_robot_samples"], dict):
-            obj["incomplete_robot_samples"] = {side: n_robot for side in obj["incomplete_robot_samples"]}
         if "episode_dir" in obj:
             obj["episode_dir"] = str(dest_dir)
         for value in obj.values():
-            _walk_counts(value, n_cam, n_robot, n_action, n_event, dest_dir)
+            _update_episode_dirs(value, dest_dir)
     elif isinstance(obj, list):
         for item in obj:
-            _walk_counts(item, n_cam, n_robot, n_action, n_event, dest_dir)
+            _update_episode_dirs(item, dest_dir)
 
 
-def rewrite_camera_meta(meta: dict, n_cam: int) -> dict:
+def rewrite_camera_meta(meta: dict, n_cam: int | dict[str, int], *,
+                        preserved_streams: set[str] | frozenset[str] = frozenset()) -> dict:
     out = deepcopy(meta)
-    for block in out.values():
+    for name, block in out.items():
+        if name in preserved_streams:
+            continue
         if isinstance(block, dict) and "frames" in block:
-            block["frames"] = n_cam
+            if isinstance(n_cam, int):
+                block["frames"] = n_cam
+            else:
+                try:
+                    key = camera_key(name, n_cam)
+                except ValueError:
+                    continue
+                block["frames"] = n_cam[key]
     return out
 
 
@@ -298,11 +332,10 @@ def validate_episode_for_export(episode: LoadedEpisode) -> None:
     for key in CAM_KEYS:
         if key not in episode.videos:
             raise ValueError(f"Missing required camera video: {key}")
-        ts = episode.cam_ts.get(key)
-        if ts is None or len(ts) != episode.n_frames:
-            raise ValueError(f"Camera timestamp count mismatch: {key}")
-        if ts.ndim != 1 or (len(ts) > 1 and np.any(np.diff(ts) <= 0)):
-            raise ValueError(f"Camera timestamps must be strictly increasing: {key}")
+        ts = validate_camera_timestamps(key, episode.cam_ts.get(key, []))
+        validate_camera_video(episode.videos[key], key, len(ts))
+    for key, ts in episode.cam_ts.items():
+        validate_camera_timestamps(key, ts)
     for name, data in [("left", episode.robot_raw.get("left", {})), ("right", episode.robot_raw.get("right", {})), ("action", episode.action_raw)]:
         ts = data.get("timestamps", [])
         if len(ts) == 0 or np.any(np.diff(np.asarray(ts, dtype=np.int64)) < 0):
@@ -334,6 +367,8 @@ def export_segment(
     dest.mkdir(parents=True)
 
     cam_ts = slice_camera_timestamps(episode.cam_ts, start, end)
+    ranges = camera_frame_ranges(episode.cam_ts, start, end)
+    camera_counts = {f"camera.{key}_rgb": len(ts) for key, ts in cam_ts.items()}
     n_cam = len(cam_ts.get("base_0", []))
     robot = slice_robot(episode.robot_raw, t0, t1)
     action = slice_keyed_lists(episode.action_raw, t0, t1)
@@ -345,23 +380,30 @@ def export_segment(
     if not n_robot or not len((robot.get("right") or {}).get("timestamps") or []) or not n_action:
         raise ValueError("Segment has no robot or action samples in its time range")
 
-    jobs: list[tuple[str, Path, Path, dict | None]] = []
+    jobs = []
     for key in CAM_KEYS:
         src = episode.videos.get(key)
         if src is None:
             continue
         name = CAM_VIDEO_NAMES[key]
         meta = episode.camera_meta.get(f"{key}_rgb") if isinstance(episode.camera_meta, dict) else None
-        jobs.append((f"camera {name}", src, dest / "camera" / name, meta if isinstance(meta, dict) else None))
+        jobs.append((f"camera {name}", src, dest / "camera" / name, meta if isinstance(meta, dict) else None, ranges[key]))
     for name, src in episode.extra_videos.items():
+        if src.suffix.lower() in PRESERVED_CAMERA_SUFFIXES:
+            continue
         # keep extra videos next to the three main cams, not nested remove_hand/
-        jobs.append((f"extra {name}", src, dest / "camera" / Path(name).name, None))
+        key = camera_key(name, ranges)
+        validate_camera_video(src, key, len(episode.cam_ts[key]))
+        meta = episode.camera_meta.get(src.stem)
+        jobs.append((f"extra {name}", src, dest / "camera" / Path(name).name,
+                     meta if isinstance(meta, dict) else None, ranges[key]))
+        camera_counts[f"camera.{Path(name).stem}"] = len(cam_ts[key])
 
     total = max(len(jobs), 1)
-    for i, (label, src, dst, meta) in enumerate(jobs):
+    for i, (label, src, dst, meta, (a, b)) in enumerate(jobs):
         if progress:
             progress(f"{dest.name}: {label}", i / (total + 1))
-        cut_video(src, dst, start, end, meta)
+        cut_video(src, dst, a, b, meta)
 
     if progress:
         progress(f"{dest.name}: write pkl/manifests", len(jobs) / (total + 1))
@@ -371,11 +413,15 @@ def export_segment(
     _dump_pickle(dest / "action" / "executed_action_dict.pkl", action)
     _dump_pickle(dest / "event" / "event_dict.pkl", event)
 
-    meta = rewrite_camera_meta(episode.camera_meta, n_cam)
+    ignored = ignored_camera_streams(episode.ref.path / "camera", episode.camera_meta)
+    meta = rewrite_camera_meta({name: block for name, block in episode.camera_meta.items() if name not in ignored},
+                               {key: len(ts) for key, ts in cam_ts.items()})
     (dest / "camera").mkdir(parents=True, exist_ok=True)
     (dest / "camera" / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
 
-    mans = rewrite_manifests(episode.manifests, subtask, n_cam, n_robot, n_action, n_event, manifest_dest or dest)
+    mans = rewrite_manifests(episode.manifests, subtask, n_cam, n_robot, n_action, n_event, manifest_dest or dest,
+        camera_counts=camera_counts, robot_counts={side: len(data.get("timestamps", [])) for side, data in robot.items()},
+        excluded_cameras=ignored)
     man_dir = dest / "manifests"
     man_dir.mkdir(parents=True, exist_ok=True)
     if mans:

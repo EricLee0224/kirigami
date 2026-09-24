@@ -30,4 +30,4 @@ if [[ -z "${QT_QPA_PLATFORM:-}" ]]; then
   fi
 fi
 cd "$ROOT"
-exec python -m kirigami.app "$@"
+exec python -X faulthandler -m kirigami.app "$@"

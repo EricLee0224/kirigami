@@ -8,7 +8,7 @@ import uuid
 
 import numpy as np
 from yaml import YAMLError
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QElapsedTimer, QSize, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QElapsedTimer, QItemSelectionModel, QSignalBlocker, QSize, Signal, Slot
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QProgressDialog,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -62,12 +61,14 @@ from .widgets import CameraLabel, JointPlot, TimelineBar
 from .robot_view import Robot3DPanel
 from .theme import apply_theme
 from .preset_dialog import PresetDialog
+from .task_progress import TaskProgressDialog
 
 
 class ExportWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
     progress = Signal(str, float)
+    completed = Signal()
 
     def __init__(self, episode: LoadedEpisode, annotation: Annotation, out_root: Path):
         super().__init__()
@@ -75,6 +76,7 @@ class ExportWorker(QObject):
         self.annotation = deepcopy(annotation)
         self.out_root = out_root
 
+    @Slot()
     def run(self) -> None:
         try:
             written = export_annotation(
@@ -86,18 +88,22 @@ class ExportWorker(QObject):
             self.finished.emit(written)
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            self.completed.emit()
 
 
 class TrimWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
     progress = Signal(str, float)
+    completed = Signal()
 
     def __init__(self, episode, annotation):
         super().__init__()
         self.episode = episode
         self.annotation = deepcopy(annotation)
 
+    @Slot()
     def run(self):
         try:
             result = trim_source(self.episode, self.annotation, *self.annotation.keep_range,
@@ -105,6 +111,8 @@ class TrimWorker(QObject):
             self.finished.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            self.completed.emit()
 
 
 class MainWindow(QMainWindow):
@@ -138,6 +146,10 @@ class MainWindow(QMainWindow):
         self._trim_worker: TrimWorker | None = None
         self._trim_result = None
         self._trim_error = ""
+        self._export_result = None
+        self._export_error = ""
+        self.trim_progress: TaskProgressDialog | None = None
+        self.progress: TaskProgressDialog | None = None
 
         self._build_ui()
         self._bind_shortcuts()
@@ -370,7 +382,8 @@ class MainWindow(QMainWindow):
         self.trim_range_label = self._label("Mark the first and last frames to keep")
         self.trim_range_label.setWordWrap(True)
         self.trim_reset_btn = self._button("Reset trim", self._reset_trim_range, "quiet")
-        self.trim_apply_btn = self._button("Trim source…", self._on_trim_source, "trim")
+        self.trim_apply_btn = self._button("Trim source", self._on_trim_source, "trim")
+        self.trim_apply_btn.setToolTip("Trim RGB and observations in the imported episode. IR/MKV files stay unchanged. No source backup is kept.")
         for button in (self.trim_in_btn, self.trim_out_btn, self.trim_reset_btn, self.trim_apply_btn):
             button.setEnabled(False)
         trim_row.addWidget(self.trim_in_btn)
@@ -494,28 +507,31 @@ class MainWindow(QMainWindow):
         self._refresh_list()
 
     def _refresh_list(self) -> None:
-        current = self.list_widget.currentRow()
-        self.list_widget.blockSignals(True)
-        self.list_widget.clear()
         completed = 0
-        for ref in self.refs:
-            if ref.is_exported:
-                flag = "●"
-                completed += 1
-            elif ref.has_annotation:
-                flag = "◐"
-            else:
-                flag = "○"
-            item = QListWidgetItem(
-                f"{flag}  Episode {ref.episode_id}\n     {ref.n_frames:,} frames  ·  {ref.duration_s:.1f}s"
-            )
-            item.setToolTip(f"{ref.task_name}\n{ref.path}")
-            item.setSizeHint(QSize(0, 70))
-            item.setData(Qt.ItemDataRole.UserRole, str(ref.path))
-            self.list_widget.addItem(item)
-        if 0 <= current < self.list_widget.count():
-            self.list_widget.setCurrentRow(current)
-        self.list_widget.blockSignals(False)
+        # Saving runs inside currentRowChanged during mousePressEvent. Clearing
+        # the model here invalidates the view's in-flight selection and scroll
+        # position. The queue only appends/clears; keep existing items in place.
+        with QSignalBlocker(self.list_widget):
+            for row, ref in enumerate(self.refs):
+                if ref.is_exported:
+                    flag = "●"
+                    completed += 1
+                elif ref.has_annotation:
+                    flag = "◐"
+                else:
+                    flag = "○"
+                item = self.list_widget.item(row)
+                if item is None:
+                    item = QListWidgetItem()
+                    item.setSizeHint(QSize(0, 70))
+                    self.list_widget.addItem(item)
+                text = f"{flag}  Episode {ref.episode_id}\n     {ref.n_frames:,} frames  ·  {ref.duration_s:.1f}s"
+                if item.text() != text:
+                    item.setText(text)
+                item.setToolTip(f"{ref.task_name}\n{ref.path}")
+                item.setData(Qt.ItemDataRole.UserRole, str(ref.path))
+            while self.list_widget.count() > len(self.refs):
+                self.list_widget.takeItem(self.list_widget.count() - 1)
         self.queue_count.setText(str(len(self.refs)))
         self.queue_summary.setText(f"{completed} of {len(self.refs)} exported" if self.refs else "No episodes loaded")
 
@@ -528,9 +544,30 @@ class MainWindow(QMainWindow):
         self.list_widget.setCurrentRow(row)
 
     def _on_select_episode(self, row: int) -> None:
-        if row < 0 or row >= len(self.refs):
+        item = self.list_widget.item(row)
+        if item is None:
             return
-        self._load_ref(self.refs[row])
+        path = item.data(Qt.ItemDataRole.UserRole)
+        ref = next((ref for ref in self.refs if str(ref.path) == path), None)
+        if ref is None:
+            return
+        self._load_ref(ref)
+        if self.episode is None or self.episode.ref.path != ref.path:
+            self._sync_episode_selection()
+            # A failed save/load cancels the switch. Mouse release can still
+            # select the attempted row, so restore again after this input event.
+            QTimer.singleShot(0, self._sync_episode_selection)
+
+    def _sync_episode_selection(self) -> None:
+        path = str(self.episode.ref.path) if self.episode is not None else None
+        with QSignalBlocker(self.list_widget):
+            for row in range(self.list_widget.count()):
+                item = self.list_widget.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == path:
+                    self.list_widget.setCurrentItem(item, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    return
+            self.list_widget.setCurrentRow(-1)
+            self.list_widget.clearSelection()
 
     # --- load / display -------------------------------------------------------
 
@@ -561,7 +598,7 @@ class MainWindow(QMainWindow):
         self._refresh_robot_view()
 
     def _load_ref(self, ref: EpisodeRef) -> None:
-        if self._trim_thread is not None:
+        if self._trim_thread is not None or self._export_thread is not None:
             return
         if not self._persist():
             return
@@ -569,7 +606,7 @@ class MainWindow(QMainWindow):
         try:
             episode = load_episode(ref.path)
             existing = load_annotation(ref.path)
-            videos = VideoBank(episode.videos) if episode.videos else None
+            videos = VideoBank(episode.videos, episode.cam_ts) if episode.videos else None
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", str(exc))
             return
@@ -596,6 +633,7 @@ class MainWindow(QMainWindow):
         if not self.out_edit.text().strip():
             self.out_edit.setPlaceholderText(str(default_output_root(ref.path.parent)))
         self.statusBar().showMessage(str(ref.path))
+        self._sync_episode_selection()
 
     def _seek(self, frame: int, *, from_playback: bool = False) -> None:
         if self.episode is None or self._trim_thread is not None:
@@ -980,7 +1018,7 @@ class MainWindow(QMainWindow):
             n = self.episode.n_frames
             changed = start > 0 or end < n
             self.trim_range_label.setText(f"Keep {start:,}–{end - 1:,} · {end - start:,} frames\nRemove head {start:,} / tail {n - end:,}")
-            self.trim_range_label.setToolTip("Frame numbers start at 0. Both displayed endpoints are retained.\nTrim source writes all synchronized streams back to the imported episode.")
+            self.trim_range_label.setToolTip("Frame numbers start at 0. Both displayed endpoints are retained.\nTrim source updates RGB and observations; IR/MKV files stay unchanged.")
         else:
             self.trim_range_label.setText("Mark the first and last frames to keep")
         self.trim_reset_btn.setEnabled(enabled and changed)
@@ -1023,17 +1061,6 @@ class MainWindow(QMainWindow):
         self.play_btn.setText("Play")
         if not self._persist():
             return
-        source = self.episode.ref.path
-        answer = QMessageBox.question(self, "Trim imported source",
-            f"Write the trimmed episode back to:\n{source}\n\n"
-            f"Keep frames {start}–{end - 1} (both included): {end - start} / {n} frames.\n"
-            f"Delete {start} leading and {n - end} trailing frames.\n\n"
-            "Camera videos, observations, robot/action/event timestamps, and counts will be trimmed together. "
-            "Absolute timestamps stay unchanged. Split labels will be rebased; existing exports will need re-exporting.\n\n"
-            f"A complete original backup will be kept under:\n{source.parent / '.kirigami-backups' / source.name}\n\nApply this trim?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
-        if answer != QMessageBox.StandardButton.Yes:
-            return
         self._save_timer.stop()
         if self.videos is not None:
             self.videos.close()
@@ -1044,50 +1071,61 @@ class MainWindow(QMainWindow):
         worker = TrimWorker(self.episode, self.annotation)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_trim_progress)
-        worker.finished.connect(self._on_trim_result)
-        worker.failed.connect(self._on_trim_error)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(self._on_trim_thread_finished)
-        thread.finished.connect(thread.deleteLater)
+        worker.progress.connect(self._on_trim_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_trim_result, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_trim_error, Qt.ConnectionType.QueuedConnection)
+        worker.completed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_trim_thread_finished, Qt.ConnectionType.QueuedConnection)
         self._trim_thread, self._trim_worker = thread, worker
         self.centralWidget().setEnabled(False)
-        self.trim_progress = QProgressDialog("Preparing source trim…", None, 0, 100, self)
-        self.trim_progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self.trim_progress.setMinimumDuration(0)
-        self.trim_progress.setValue(0)
+        self.trim_progress = TaskProgressDialog("Trim source", "Preparing source trim…", self)
+        self.trim_progress.show()
         thread.start()
 
+    @Slot(str, float)
     def _on_trim_progress(self, message: str, fraction: float) -> None:
-        self.trim_progress.setLabelText(message)
-        self.trim_progress.setValue(int(fraction * 100))
+        if self.trim_progress is not None:
+            self.trim_progress.setLabelText(message)
+            self.trim_progress.setValue(int(fraction * 100))
 
+    @Slot(object)
     def _on_trim_result(self, result) -> None:
         self._trim_result = result
 
+    @Slot(str)
     def _on_trim_error(self, message: str) -> None:
         self._trim_error = message
 
+    @Slot()
     def _on_trim_thread_finished(self) -> None:
-        self._trim_thread, self._trim_worker = None, None
-        self.trim_progress.reset()
-        self.centralWidget().setEnabled(True)
-        # The old annotation's frame numbers must never be saved after source replacement.
+        thread = self._trim_thread
+        if thread is None:
+            return
+        # QThread.finished is emitted BEFORE deferred deletes and thread-local
+        # cleanup finish. Keep Python wrappers alive until that work has ended.
+        thread.wait()
+        # Hiding the progress dialog restores focus and can finish an editor.
+        # Invalidate old frame numbers before any of those focus events run.
         self.annotation = None
+        self._trim_thread, self._trim_worker = None, None
+        thread.deleteLater()
+        if self.trim_progress is not None:
+            self.trim_progress.finish()
+            self.trim_progress = None
+        # The old annotation's frame numbers must never be saved after source replacement.
         self._load_ref(self._trim_ref)
+        self.centralWidget().setEnabled(True)
         if self._trim_error:
             QMessageBox.critical(self, "Source trim failed", self._trim_error)
         elif self._trim_result is not None:
             result = self._trim_result
             self.save_status.setText("SOURCE TRIMMED")
-            text = f"Saved {result.n_frames:,} frames back to:\n{result.source}\n\nOriginal backup:\n{result.backup}"
+            text = (f"Source trimmed · {result.n_frames:,} frames retained · "
+                    f"removed {result.removed_head:,} head / {result.removed_tail:,} tail · {result.source}")
+            self.statusBar().showMessage(text, 12000)
             if result.warning:
                 QMessageBox.warning(self, "Source trimmed", text + "\n\n" + result.warning)
-            else:
-                QMessageBox.information(self, "Source trimmed", text)
 
     # --- export ---------------------------------------------------------------
 
@@ -1129,42 +1167,58 @@ class MainWindow(QMainWindow):
 
         self.confirm_btn.setEnabled(False)
         self.list_widget.setEnabled(False)
-        self.progress = QProgressDialog("Exporting…", None, 0, 100, self)
-        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress.setMinimumDuration(0)
-        self.progress.setValue(0)
+        self._export_result, self._export_error = None, ""
+        self.progress = TaskProgressDialog("Export segments", "Exporting…", self)
+        self.progress.show()
 
         thread = QThread(self)
         worker = ExportWorker(self.episode, self.annotation, out_root)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(self._on_export_progress)
-        worker.finished.connect(self._on_export_done)
-        worker.failed.connect(self._on_export_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(self._on_export_thread_finished)
-        thread.finished.connect(thread.deleteLater)
+        worker.progress.connect(self._on_export_progress, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_export_result, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_export_error, Qt.ConnectionType.QueuedConnection)
+        worker.completed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_export_thread_finished, Qt.ConnectionType.QueuedConnection)
         self._export_thread = thread
         self._export_worker = worker
         thread.start()
 
+    @Slot(object)
+    def _on_export_result(self, written) -> None:
+        self._export_result = written
+
+    @Slot(str)
+    def _on_export_error(self, message: str) -> None:
+        self._export_error = message
+
+    @Slot()
     def _on_export_thread_finished(self) -> None:
+        thread = self._export_thread
+        if thread is None:
+            return
+        thread.wait()
         self._export_thread = None
         self._export_worker = None
+        thread.deleteLater()
+        if self.progress is not None:
+            self.progress.finish()
+            self.progress = None
+        if self._export_error:
+            self._on_export_failed(self._export_error)
+        elif self._export_result is not None:
+            self._on_export_done(self._export_result)
 
+    @Slot(str, float)
     def _on_export_progress(self, msg: str, frac: float) -> None:
-        if hasattr(self, "progress"):
+        if self.progress is not None:
             self.progress.setLabelText(msg)
             self.progress.setValue(int(frac * 100))
 
     def _on_export_done(self, written) -> None:
         self.confirm_btn.setEnabled(True)
         self.list_widget.setEnabled(True)
-        if hasattr(self, "progress"):
-            self.progress.reset()
         if self.episode is not None and self.annotation is not None:
             out_root = self._active_export_root
             if out_root is not None:
@@ -1177,8 +1231,6 @@ class MainWindow(QMainWindow):
     def _on_export_failed(self, message: str) -> None:
         self.confirm_btn.setEnabled(True)
         self.list_widget.setEnabled(True)
-        if hasattr(self, "progress"):
-            self.progress.reset()
         QMessageBox.critical(self, "Export failed", message)
 
     def _advance_to_next_pending(self) -> None:

@@ -1,4 +1,4 @@
-"""Source trimming must preserve synchronization and recoverable original bytes."""
+"""Source trimming overwrites in place without keeping successful-trim backups."""
 
 from copy import deepcopy
 import hashlib
@@ -17,7 +17,7 @@ from kirigami.annotation import annotation_from_episode, load_annotation, mark_e
 from kirigami.exporter import export_annotation
 from kirigami.loader import discover_episodes, load_episode
 from kirigami.source_guard import SourceChangedError, episode_lock
-from kirigami.trimming import _exchange_directories, cut_video, trim_source
+from kirigami.trimming import _exchange_directories, _sync_dir, cut_video, trim_source
 from kirigami.annotation import atomic_write_text
 from tests.test_core import _write_synthetic
 
@@ -53,7 +53,11 @@ class TestSourceTrim(unittest.TestCase):
         mark_exported(self.ann, self.root / "exports")
         save_annotation(self.source, self.ann)
 
-    def test_trim_synchronizes_streams_preserves_backup_and_rebases_labels(self):
+    def _assert_no_trim_artifacts(self):
+        self.assertFalse((self.source.parent / ".kirigami-backups").exists())
+        self.assertFalse(list(self.source.parent.glob(".kirigami-trim-*")))
+
+    def test_trim_synchronizes_streams_without_backup_and_rebases_labels(self):
         (self.source / "README.txt").write_text("Keep task instructions unchanged\n")
         nested = self.source / "camera/remove_hand/base_0_rgb.mp4"
         nested.parent.mkdir()
@@ -74,19 +78,20 @@ class TestSourceTrim(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text())
         manifest["rec"]["robot_samples"] = {"left": 60, "right": 30}
         manifest_path.write_text(json.dumps(manifest))
-        before = contents(self.source)
         old_task = manifest["rec"]["metadata"]["task"]
         result = trim_source(self.episode, self.ann, 5, 16)
         self.assertEqual(result.source, self.source)
         self.assertEqual(result.n_frames, 11)
         self.assertEqual((result.removed_head, result.removed_tail), (5, 4))
-        self.assertEqual(contents(result.backup), before)
+        self.assertFalse(result.warning)
+        self._assert_no_trim_artifacts()
         loaded = load_episode(self.source)
         self.assertEqual(loaded.n_frames, 11)
-        for key in loaded.cam_ts:
-            np.testing.assert_array_equal(loaded.cam_ts[key], self.episode.cam_ts[key][5:16])
-        np.testing.assert_array_equal(loaded.left_joint_aligned, self.episode.left_joint_aligned[5:16])
         t0, t1 = self.episode.frame_range_timestamps(5, 16)
+        for key in loaded.cam_ts:
+            ts = self.episode.cam_ts[key]
+            np.testing.assert_array_equal(loaded.cam_ts[key], ts[(ts >= t0) & (ts < t1)])
+        np.testing.assert_array_equal(loaded.left_joint_aligned, self.episode.left_joint_aligned[5:16])
         for key in ("left", "right"):
             expected = [ts for ts in robot[key]["timestamps"] if t0 <= ts < t1]
             self.assertEqual(loaded.robot_raw[key]["timestamps"], expected)
@@ -114,6 +119,9 @@ class TestSourceTrim(unittest.TestCase):
                          [(0, 3, "pick", False), (3, 11, "place", True)])
         self.assertEqual(adjusted.keep_range, (0, 11))
         self.assertFalse(adjusted.exported_at)
+        history = json.loads((self.source / "annotations/trim_history.json").read_text())
+        self.assertEqual((history[-1]["start_frame"], history[-1]["end_frame"]), (5, 16))
+        self.assertNotIn("backup_path", history[-1])
         self.assertEqual([ref.path for ref in discover_episodes(self.source.parent)], [self.source])
 
     def test_invalid_and_empty_ranges_leave_original_untouched(self):
@@ -140,7 +148,7 @@ class TestSourceTrim(unittest.TestCase):
         with patch("kirigami.trimming.cut_video", side_effect=fail_second), self.assertRaisesRegex(RuntimeError, "Encoder stopped"):
             trim_source(self.episode, self.ann, 5, 16)
         self.assertEqual(contents(self.source), before)
-        self.assertFalse(list(self.source.parent.glob(".kirigami-backups/0007/*/original")))
+        self._assert_no_trim_artifacts()
 
     def test_atomic_exchange_failure_retains_source(self):
         before = contents(self.source)
@@ -148,18 +156,23 @@ class TestSourceTrim(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "Unsupported filesystem"):
                 trim_source(self.episode, self.ann, 5, 16)
         self.assertEqual(contents(self.source), before)
+        self._assert_no_trim_artifacts()
 
-    def test_interruption_immediately_after_exchange_preserves_original_backup(self):
-        before = contents(self.source)
+    def test_interruption_immediately_after_exchange_cleans_up_old_data(self):
         def interrupted(source, prepared):
             _exchange_directories(source, prepared)
             raise KeyboardInterrupt()
         with patch("kirigami.trimming._exchange_directories", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
             trim_source(self.episode, self.ann, 5, 16)
         self.assertEqual(load_episode(self.source).n_frames, 11)
-        backups = list(self.source.parent.glob(".kirigami-backups/0007/*/original"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(contents(backups[0]), before)
+        self._assert_no_trim_artifacts()
+
+    def test_interruption_before_exchange_preserves_source_and_removes_staging(self):
+        before = contents(self.source)
+        with patch("kirigami.trimming._exchange_directories", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            trim_source(self.episode, self.ann, 5, 16)
+        self.assertEqual(contents(self.source), before)
+        self._assert_no_trim_artifacts()
 
     def test_stale_windows_cannot_overwrite_or_export_changed_source(self):
         trim_source(self.episode, self.ann, 5, 16)
@@ -206,30 +219,58 @@ class TestSourceTrim(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symlink"):
             trim_source(self.episode, self.ann, 5, 16)
 
-    def test_repeated_trims_keep_separate_originals(self):
-        first = trim_source(self.episode, self.ann, 5, 16)
+    def test_repeated_trims_keep_history_without_accumulating_backups(self):
+        trim_source(self.episode, self.ann, 5, 16)
+        self._assert_no_trim_artifacts()
         second_episode = load_episode(self.source)
         second_ann = load_annotation(self.source)
-        before_second = contents(self.source)
-        second = trim_source(second_episode, second_ann, 1, 7)
-        self.assertNotEqual(first.backup, second.backup)
-        self.assertEqual(contents(second.backup), before_second)
-        self.assertEqual(load_episode(first.backup).n_frames, 20)
+        trim_source(second_episode, second_ann, 1, 7)
+        self._assert_no_trim_artifacts()
         self.assertEqual(load_episode(self.source).n_frames, 6)
         history = json.loads((self.source / "annotations/trim_history.json").read_text())
         self.assertEqual(len(history), 2)
+        self.assertEqual([(item["start_frame"], item["end_frame"]) for item in history], [(5, 16), (1, 7)])
+        self.assertTrue(all("backup_path" not in item for item in history))
 
-    def test_final_journal_failure_reports_applied_trim_with_backup(self):
-        before = contents(self.source)
-        def fail_committed_journal(path, text):
-            if path.name == "transaction.json" and json.loads(text).get("state") == "committed":
-                raise OSError("Journal disk error")
-            return atomic_write_text(path, text)
-        with patch("kirigami.trimming.atomic_write_text", side_effect=fail_committed_journal):
+    def test_final_sync_failure_reports_applied_trim_and_cleans_temporary_data(self):
+        calls = 0
+        def fail_after_exchange(path):
+            nonlocal calls
+            if path == self.source.parent:
+                calls += 1
+                if calls == 2:
+                    raise OSError("Directory sync error")
+            return _sync_dir(path)
+        with patch("kirigami.trimming._sync_dir", side_effect=fail_after_exchange):
             result = trim_source(self.episode, self.ann, 5, 16)
         self.assertIn("Trim was applied", result.warning)
+        self.assertIn("Directory sync error", result.warning)
         self.assertEqual(load_episode(self.source).n_frames, 11)
-        self.assertEqual(contents(result.backup), before)
+        self._assert_no_trim_artifacts()
+
+    def test_cleanup_failure_reports_leftover_temporary_data(self):
+        before = contents(self.source)
+        with patch("kirigami.trimming.shutil.rmtree", side_effect=OSError("Cleanup failed")):
+            result = trim_source(self.episode, self.ann, 5, 16)
+        self.assertEqual(load_episode(self.source).n_frames, 11)
+        self.assertIn("Trim was applied", result.warning)
+        self.assertIn("Cleanup failed", result.warning)
+        temporary = list(self.source.parent.glob(".kirigami-trim-*"))
+        self.assertEqual(len(temporary), 1)
+        self.assertIn(str(temporary[0]), result.warning)
+        self.assertEqual(contents(temporary[0] / "episode"), before)
+        self.assertFalse((self.source.parent / ".kirigami-backups").exists())
+
+    def test_staging_journal_failure_leaves_original_untouched(self):
+        before = contents(self.source)
+        def fail_journal(path, text):
+            if path.name == "transaction.json":
+                raise OSError("Journal disk error")
+            return atomic_write_text(path, text)
+        with patch("kirigami.trimming.atomic_write_text", side_effect=fail_journal), self.assertRaisesRegex(OSError, "Journal disk error"):
+            trim_source(self.episode, self.ann, 5, 16)
+        self.assertEqual(contents(self.source), before)
+        self._assert_no_trim_artifacts()
 
     def test_mismatched_observation_arrays_are_rejected(self):
         obs = self.source / "observations"

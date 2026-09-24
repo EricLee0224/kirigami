@@ -4,11 +4,11 @@ Kirigami 是用于机器人演示数据的桌面标注工具，支持读取 Prom
 
 推荐工作顺序：**安装环境 → 打开 GUI → 导入 episode → Trim 首尾 → 标注子任务分段 → 导出 Slice**。
 
-本文使用一个完整例子：原始 episode 有 **1,200 帧**，去掉首尾各 **100 帧**，再将剩下的 **1,000 帧**分成 `approach`、`pick`、`place`、`return` 四个子任务。所有 `/data/robot_demo/...` 都是示例数据路径，请换成自己的路径。
+本文使用一个完整例子：原始 episode 有 **1,200 帧**，去掉首尾各 **100 帧**，再将剩下的 **1,000 帧**分成 `approach`、`pick`、`place`、`return` 四个子任务。界面中的帧号和 episode 帧数以主相机 `base_0` 为准，腕部相机允许具有不同帧数。所有 `/data/robot_demo/...` 都是示例数据路径，请换成自己的路径。
 
 | 操作 | GUI 按钮 | 保存结果 |
 | --- | --- | --- |
-| Trim：手动去掉首尾静止部分 | `Keep in`、`Keep out`、`Trim source…` | 确认后写回原 episode 目录，并保留完整原始备份 |
+| Trim：手动去掉首尾静止部分 | `Keep in`、`Keep out`、`Trim source` | 点击后直接覆盖原 episode，不弹确认框，不保留原数据备份 |
 | Slice：按子任务分段导出 | `+ Split M`、`Export segments →` | 在导出目录生成独立的短 episode，保留源 episode 的视频和观测 |
 
 阅读导航：[安装环境](#安装环境) · [激活环境](#激活环境) · [打开 GUI](#打开-gui) · [Trim 示例](#示例一-trim-首尾静止帧) · [添加子任务名](#添加新的子任务名) · [Slice 示例](#示例二-slice-成四个子任务) · [常见问题](#常见问题)
@@ -159,7 +159,7 @@ python -m kirigami.app
    Remove head 100 / tail 100
    ```
 
-5. 点击 **Trim source…**，核对弹窗中的原始目录、保留帧数、删除帧数和备份位置，确认后等待完成。
+5. 点击 **Trim source**，程序立即按所标范围裁剪并覆盖原 episode，不再弹出确认框。等待进度完成即可。
 
 **Keep in 和 Keep out 选中的两帧都会保留。** 使用 `I` / `O` 快捷键时，请先离开名称或帧号输入框；直接点击按钮也可以。
 
@@ -167,14 +167,11 @@ python -m kirigami.app
 
 - 裁剪后的数据仍位于 `/data/robot_demo/demo_task/0007/`，GUI 自动重新加载该 episode。
 - 新 episode 有 **1,000 帧**，显示帧号变为 **0–999**：新第 0 帧对应裁剪前第 100 帧，新第 999 帧对应裁剪前第 1099 帧。
-- 相机视频、观测和对应时间戳同步裁剪，相关样本计数同步更新。数据中的绝对时间戳保持原值。
-- 原始 1,200 帧的完整 episode 保存在独立备份目录：
+- RGB `.mp4`、观测和对应时间戳同步裁剪，相关样本计数同步更新。数据中的绝对时间戳保持原值；IR `.mkv` 原样保留，不参与裁剪。
+- 原始 1,200 帧的数据被替换为裁剪后的 1,000 帧，不保留原 episode 备份；处理用的临时目录在完成后删除。
+- 完成后状态栏显示保留帧数和首尾删除帧数，无需再关闭成功提示框。
 
-  ```text
-  /data/robot_demo/demo_task/.kirigami-backups/0007/<时间与唯一标识>/original/
-  ```
-
-只设置 `Keep in` / `Keep out` 会保存待执行的边界标签；**点击 Trim source 并确认后才改写原数据**。`Reset trim` 用于清除尚未执行的边界选择，不能撤销已经完成的裁剪。恢复已裁剪数据的方法见[备份与恢复](#备份与恢复)。
+只设置 `Keep in` / `Keep out` 会保存待执行的边界标签；**点击 Trim source 就会直接改写原数据**。`Reset trim` 用于清除尚未执行的边界选择，不能撤销已经完成的裁剪。写回方式见[Trim 写回与异常处理](#trim-写回与异常处理)。
 
 如果之前已经标好了子任务分段，Trim 会保留与新范围相交的标签、调整其帧号，并移除范围外的分段；已导出的切片需要重新导出。因此建议先完成 Trim，再做下面的子任务标注。
 
@@ -326,7 +323,7 @@ subtasks:
 └── slice_meta.json
 ```
 
-本例中，`pick` 的三路相机各有 **300 帧**；机器人状态和动作按对应时间范围筛选，条数由实际采样频率决定。`slice_meta.json` 记录子任务名称、源 episode 路径、`start_frame=200`、`end_frame=500`、`n_frames=300` 和起止时间戳。这些帧号相对于 Trim 后的源 episode；回溯 Trim 前的范围可以查看源 episode 的 `annotations/trim_history.json`。
+本例中，`pick` 的主相机有 **300 帧**；两路腕部相机、机器人状态和动作按同一时间范围筛选，数量由各自的实际采样决定。`slice_meta.json` 记录子任务名称、源 episode 路径、`start_frame=200`、`end_frame=500`、`n_frames=300` 和起止时间戳。这些帧号相对于 Trim 后的主相机；回溯 Trim 前的范围可以查看源 episode 的 `annotations/trim_history.json`。
 
 输出名称中的 `<来源标识>` 是源 episode 绝对路径生成的 12 位哈希，用于区分不同任务目录中同名的 `0007`。`00`–`03` 是原分段表中的序号；跳过一段时，后续序号不会重新排列。同一个子任务名可以对应多个独立的 episode 文件夹。
 
@@ -338,36 +335,43 @@ subtasks:
 | --- | --- | --- |
 | 三路主相机视频与时间戳 | 支持 | 支持 |
 | 标准 `robot/`、`action/`、`event/` 数据 | 支持 | 支持标准的时间戳对齐列表字段 |
-| 相机元数据、manifest 样本计数 | 更新，保留原任务描述 | 更新，并写入对应子任务描述 |
+| 相机元数据、manifest 样本计数 | 更新 RGB，保留 IR 帧数和原任务描述 | 移除 IR 条目，更新计数并写入对应子任务描述 |
 | 独立 `observation/` 或 `observations/` 数据 | 支持 PKL、JSON、NPY、NPZ 的规定结构 | **目前不会导出这些附加文件** |
-| 附加相机视频 | 匹配相机键后裁剪，保留原相对路径 | 裁剪已识别的附加视频，平铺保存到 `camera/` |
+| 附加 `.mp4` 相机视频 | 匹配相机键后裁剪，保留原相对路径 | 裁剪已识别的附加视频，平铺保存到 `camera/` |
+| IR `.mkv` 视频 | 原样保留，不解码、不裁剪、不重新编码 | 不导出 |
+
+Trim / Slice 只处理 RGB 及附加 `.mp4` 视频。`camera/` 下所有 `.mkv`（包括子目录中的文件）作为原始附件保留，不检查编码或帧数，不因 IR 不完整而阻止 RGB 裁剪。Trim 使用同一文件系统内的硬链接保留文件，完成后仍是原来的文件内容，无需复制整段 IR 视频。
+
+IR 保持首次采用此规则进行 Trim 前的长度，其元数据帧数和 manifest 中的 IR 计数保持原值。首次 Trim 会将当时的相机时间戳单独保存在 `camera/ir_timestamp.pkl`，把 IR 元数据中原来指向 `camera/timestamp.pkl` 的引用改到该文件，并标注 `kirigami_trim_policy: preserve_untrimmed`；连续 Trim 不会再次裁剪或覆盖这些 IR 时间戳。`camera/timestamp.pkl` 继续对应裁剪后的 RGB。**未裁剪的 IR 不属于裁剪后的训练时间线。** Slice 不输出 MKV、IR 时间戳及对应的相机元数据和 manifest 计数。此规则只影响之后的操作，不能恢复以前已经裁掉的 IR 帧。
 
 **如果训练依赖独立 observation 文件或自定义嵌套观测数组，需要先适配 Slice 导出逻辑。** 当前短 episode 的标准机器人观测来自 `robot/robot_state_dict.pkl`；Trim 对附加格式的支持不代表 Slice 已覆盖同样的格式。
 
-相机按分界点对应的帧区间截取，机器人状态、动作和事件按该区间的 Unix 毫秒时间戳筛选，不要求它们与相机具有相同的采样频率。保留的数据时间戳不会归零；重新编码的视频自身播放时间从 0 开始。
+主相机的分界帧确定 Unix 毫秒时间区间 `[t_start, t_end)`。Trim 和 Slice 都在各路相机自己的时间戳中查找这个区间，再用对应的局部帧号裁剪该路 `.mp4` 视频；机器人状态、动作和事件也按同一区间筛选。各路可以有不同的采样频率、起止时间或丢帧，裁剪后保留各自的实际帧数和原始时间戳，元数据及 manifest 按各路分别更新。重新编码的视频自身播放时间从 0 开始。
 
-切片导出要求三路主相机时间戳数量一致、相机时间戳严格递增，并且每段包含机器人和动作样本。视频逐帧裁剪后会重新编码，可能引入压缩损失；程序会通过解码核对输出帧数。
+GUI 预览以主相机当前帧的时间为基准，为腕部相机选择时间戳最近的画面。因此，相机帧数不同也能同步查看，不会因为直接使用相同帧号而逐渐错位。
+
+三路主相机的帧数不必相等，但**每一路参与裁剪的 `.mp4` 视频的帧数必须与该路自己的时间戳数量一致**，且相机时间戳严格递增。所选时间范围内需要有各路相机帧、机器人和动作样本。视频逐帧裁剪后会重新编码，可能引入压缩损失；程序会通过解码核对输出帧数。
 
 Trim 中，独立观测表带有 `timestamps` 时按时间筛选；没有时间戳的数组或表必须与相机一帧一行对应。无法识别的文件、采样数量不匹配或源目录中的符号链接会阻止写回，并显示相关路径。
 
-## 备份与恢复
+录制程序生成的 `robot/state_joint_vis.png`、`robot/state_eef_xyz_vis.png` 是整段数据的预览图。Trim 会清除这些过期图片及其 manifest 引用；GUI 的关节曲线按裁剪后的观测重新绘制。
 
-每次 Trim 都会生成独立备份，目录不会自动加入 episode 队列。`annotations/trim_history.json` 记录裁剪范围和备份位置。
+## Trim 写回与异常处理
 
-恢复一次已完成的 Trim 时：
+**Trim source 采用直接覆盖模式：不弹确认框，成功后不保留原数据备份。** `annotations/trim_history.json` 只记录每次裁剪的范围、帧数和时间戳，便于回溯帧号；它不包含被删掉的视频或观测，不能用于撤销裁剪。
 
-1. 关闭正在使用该 episode 的窗口。
-2. 将当前 episode 整个目录移到其他位置，保留现有结果。
-3. 将对应备份的 `original/` **完整复制**回原 episode 路径，再重新导入。
+以前版本已经生成的备份不会被自动删除；新版后续的 Trim 不再生成这类备份。
 
-恢复时应一起恢复视频、观测、时间戳和标注，避免混用两个版本的数据。当前 GUI 没有一键恢复按钮。
+连续处理多个 episode 时，每次 Trim 或 Slice 都会等后台线程完成清理，再关闭并释放进度窗口。Trim 自动重新加载当前 episode 后，即可选择下一条继续标注。更新代码后需要关闭旧版窗口并重新启动 GUI。
 
 <details>
-<summary>写回方式、中断恢复与多窗口处理</summary>
+<summary>临时文件、异常处理与多窗口处理</summary>
 
-Trim 先准备和校验完整的新 episode，再通过 Linux `renameat2(RENAME_EXCHANGE)` 交换原目录与准备好的目录。文件系统不支持该操作，或交换前处理失败时，源数据保持原样。交换后发生目录同步或日志错误时，程序会报告“裁剪已应用”，并保留原始备份。
+Trim 在源 episode 的同级 `.kirigami-trim-*` 临时目录中准备和校验完整的新数据，再通过 Linux `renameat2(RENAME_EXCHANGE)` 替换原目录，随后删除临时目录中的旧数据。准备期间需要额外空间容纳裁剪后的 RGB 与观测；原样保留的 MKV 使用硬链接，不额外占用一份视频空间。成功后只保留原路径下的新数据。
 
-每个备份的上一级目录中有 `transaction.json`。进程被强制终止或断电后，不要直接清理未完成的事务目录：`prepared` 状态可能位于目录交换的前后两侧。源 episode 的 Trim 历史中存在同一事务 ID，说明该次裁剪已应用，此时 `original/` 保存旧数据；否则应先检查两份目录，再确定恢复方式。
+编码、校验失败或文件系统不支持目录交换时，原数据保持原样。已经替换成功但目录同步或临时文件清理失败时，程序会明确报告裁剪已应用及具体错误，避免重复执行同一次裁剪。
+
+强制结束进程或断电可能留下尚未清理的 `.kirigami-trim-*` 目录，其中的 `transaction.json` 记录源路径和事务 ID。`prepared` 状态可能位于目录交换的前后两侧：源 episode 的 `annotations/trim_history.json` 中存在同一事务 ID，说明该次裁剪已应用，临时 `episode/` 是待清理的旧数据；否则应先检查源目录与临时目录的完整性。临时文件不作为长期备份使用。
 
 当前版本通过主机上的 episode 锁协调读取、导出和 Trim。检测到源数据已被另一个窗口裁剪时，会重新加载，并将旧窗口尚未保存的标签保存在 `.kirigami-backups/stale-labels/`，避免用旧帧号覆盖新标注。使用同一数据的旧版程序或外部写入程序不受该机制协调。
 
@@ -421,7 +425,7 @@ export KIRIGAMI_YAM_ULTRA_DIR=/path/to/yam_ultra/v2
 | 提示没有桌面、无法连接 DISPLAY | 在已登录主机图形桌面的终端运行；不要随意填写 DISPLAY 来绕过错误 |
 | 继承了 `QT_QPA_PLATFORM=offscreen` 等设置 | 执行 `unset QT_QPA_PLATFORM`，再从桌面终端运行启动脚本 |
 | `--check` 的窗口自动关闭 | 属于预期行为；检查结束会退出，正常使用请去掉 `--check` |
-| `Trim source…` 按钮不可用 | 先导入 episode 并选择非空保留范围，且至少去掉一帧；保留整段时无需 Trim |
+| `Trim source` 按钮不可用 | 先导入 episode 并选择非空保留范围，且至少去掉一帧；保留整段时无需 Trim |
 | 在 FRAME 输入框里按 I / O 没反应 | 先点击 Keep in / Keep out 按钮，或移出输入框后再按快捷键 |
 | 导出提示 `Missing subtask` | 给每个勾选 Export 的分段填名字，或取消该段的 Export |
 | Trim 提示不支持某个数据文件 | 该文件需要明确的同步裁剪规则；保留它并适配格式后再写回 |
@@ -432,7 +436,7 @@ export KIRIGAMI_YAM_ULTRA_DIR=/path/to/yam_ultra/v2
 在仓库根目录、已激活 `kirigami` 环境的终端中运行：
 
 ```bash
-python -m unittest tests.test_core tests.test_safety tests.test_robot_meshes tests.test_trimming -v
+python -m unittest tests.test_core tests.test_safety tests.test_robot_meshes tests.test_trimming tests.test_camera_sync tests.test_infrared -v
 ```
 
 GUI 与 GPU 测试需要主机真实桌面：
